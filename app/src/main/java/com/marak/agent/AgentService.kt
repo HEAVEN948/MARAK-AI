@@ -37,6 +37,8 @@ class AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
     class El(val i: Int, val text: String, val desc: String, val id: String,
              val click: Boolean, val edit: Boolean, val x: Int, val y: Int)
 
+    private val MODEL = "gemini-flash-latest"
+
     private val main = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
     private var btn: TextView? = null
@@ -235,7 +237,7 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
                 JSONArray().put(JSONObject().put("text", prompt)))))
             .put("generationConfig", JSONObject()
                 .put("responseMimeType", "application/json").put("temperature", 0.2))
-        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent")
+        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent")
             .openConnection() as HttpURLConnection
         c.requestMethod = "POST"
         c.setRequestProperty("Content-Type", "application/json")
