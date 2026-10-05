@@ -9,10 +9,14 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -43,13 +47,27 @@ class AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
     private var btn: TextView? = null
     private var rec: SpeechRecognizer? = null
-    @Volatile private var running = false
+    private val tone by lazy { ToneGenerator(AudioManager.STREAM_MUSIC, 70) }
+    @Volatile private var gen = 0
+    @Volatile private var lastEvt = 0L
+    @Volatile private var conn: HttpURLConnection? = null
 
-    private val SYS = """You are MARAK, an agent that controls an Android phone through accessibility. Achieve the user's goal step by step.
-Each turn you get the current app, installed apps (label:package) and the visible screen elements (index|text|desc|id|click|edit).
-Reply ONLY with one JSON object: {"thought":"short","action":"","index":0,"text":"","package":"","key":"","direction":"","risky":false,"message":""}
+    private fun alive(g: Int) = g == gen
+
+    private val SYS = """You are MARAK, a fast, polite phone assistant. You operate an Android phone for the user the way a skilled person would. Work step by step toward the goal.
+Each turn you see the current app, the installed apps (label:package) and the screen elements (index|text|desc|id|flags where c=clickable e=editable).
+Reply ONLY with one JSON object: {"action":"","index":0,"text":"","package":"","key":"","direction":"","risky":false,"message":""}
 Actions: open_app(package) | tap(index) | type(text) | key(back|home|recents|enter) | swipe(direction up|down|left|right) | wait | ask_user(message) | done(message).
-Rules: tap a search field before typing. After typing a search, use key enter. swipe up scrolls the page down. Set risky=true for anything that buys, pays, sends, posts, deletes or changes account settings. Never enter passwords or OTPs: use ask_user. If the screen list is empty the app may block reading: use done and tell the user. Use done when finished and summarize in message. Keep thought under 8 words."""
+Rules:
+- Take the shortest path. Do not reopen an app that is already open. Prefer search boxes over scrolling.
+- Tap a search field before typing, then use key enter.
+- swipe up scrolls the page down.
+- Do exactly what the user asked and nothing extra. If the request is unclear, use ask_user with one short question.
+- Set risky=true for anything that buys, pays, sends, posts, deletes or changes settings, and put a short natural yes/no question in message, like: Should I send it to Rahul?
+- Never enter passwords or OTPs: use ask_user.
+- If the screen is empty or blocked, use done and say so.
+- message is spoken aloud: one or two short, warm, natural sentences in first person, no technical words, no emojis, no lists. Example: Here are the cheapest car mirrors on Amazon.
+- When finished, use done."""
 
     override fun onServiceConnected() {
         instance = this
@@ -57,8 +75,12 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         addButton()
     }
 
-    override fun onInit(status: Int) { tts?.language = Locale.getDefault() }
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    override fun onInit(status: Int) {
+        tts?.language = Locale.getDefault()
+        tts?.setSpeechRate(1.1f)
+    }
+
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) { lastEvt = SystemClock.uptimeMillis() }
     override fun onInterrupt() {}
 
     override fun onDestroy() {
@@ -81,7 +103,8 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         bg.setColor(Color.parseColor("#CC1A73E8"))
         b.background = bg
         b.setOnClickListener {
-            if (running) { running = false; say("Stopped") } else listenThenRun()
+            val g = interrupt()
+            listenThenRun(g)
         }
         val lp = WindowManager.LayoutParams(
             150, 150,
@@ -93,22 +116,44 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         btn = b
     }
 
-    private fun paint() {
-        main.post {
-            (btn?.background as? GradientDrawable)
-                ?.setColor(Color.parseColor(if (running) "#CCD93025" else "#CC1A73E8"))
+    private fun paint(s: Int) {
+        val c = when (s) {
+            1 -> "#CC188038"
+            2 -> "#CCE8710A"
+            else -> "#CC1A73E8"
         }
+        main.post { (btn?.background as? GradientDrawable)?.setColor(Color.parseColor(c)) }
+    }
+
+    private fun beep() {
+        try { tone.startTone(ToneGenerator.TONE_PROP_BEEP, 90) } catch (e: Exception) {}
     }
 
     fun say(t: String) {
-        main.post { Toast.makeText(this, t, Toast.LENGTH_LONG).show() }
+        main.post { Toast.makeText(this, t, Toast.LENGTH_SHORT).show() }
         tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "m")
     }
 
-    private fun listenOnce(): String {
-        Thread.sleep(500)
-        var n = 0
-        while (tts?.isSpeaking == true && n < 50) { Thread.sleep(200); n++ }
+    private fun interrupt(): Int {
+        val g = ++gen
+        tts?.stop()
+        main.post { try { rec?.cancel() } catch (e: Exception) {} }
+        val c = conn
+        if (c != null) Thread { try { c.disconnect() } catch (e: Exception) {} }.start()
+        return g
+    }
+
+    private fun listenOnce(g: Int, afterSpeech: Boolean): String {
+        if (afterSpeech) {
+            Thread.sleep(250)
+            var n = 0
+            while (tts?.isSpeaking == true && n < 60 && alive(g)) { Thread.sleep(100); n++ }
+        }
+        if (!alive(g)) return ""
+        paint(1)
+        beep()
+        Thread.sleep(220)
+        if (!alive(g)) return ""
         val latch = CountDownLatch(1)
         var out = ""
         main.post {
@@ -134,45 +179,72 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
                 val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                     RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
+                i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
                 r.startListening(i)
             } catch (e: Exception) { latch.countDown() }
         }
-        latch.await(20, TimeUnit.SECONDS)
+        val end = SystemClock.uptimeMillis() + 15000
+        while (alive(g) && SystemClock.uptimeMillis() < end) {
+            if (latch.await(100, TimeUnit.MILLISECONDS)) break
+        }
+        if (!alive(g)) return ""
         return out
     }
 
-    private fun listenThenRun() {
-        if (running) return
-        running = true
-        paint()
-        say("Listening")
+    private fun listenThenRun(g: Int) {
         Thread {
-            val c = listenOnce()
-            if (c.isBlank() || !running) {
-                running = false
-                paint()
-                say("Didn't catch that")
-            } else runAgent(c)
+            val c = listenOnce(g, false)
+            if (!alive(g)) return@Thread
+            if (c.isBlank()) {
+                paint(0)
+                say("Sorry, I didn't catch that.")
+                return@Thread
+            }
+            runTask(c, g)
         }.start()
     }
 
     fun startTask(goal: String) {
-        if (running || goal.isBlank()) return
-        running = true
-        paint()
-        Thread { runAgent(goal) }.start()
+        if (goal.isBlank()) return
+        val g = interrupt()
+        Thread { runTask(goal.trim(), g) }.start()
+    }
+
+    private fun runTask(goal: String, g: Int) {
+        paint(2)
+        try {
+            if (quick(goal)) return
+            agent(goal, g)
+        } catch (e: Exception) {
+            if (alive(g)) say(friendly(e))
+        } finally {
+            if (alive(g)) paint(0)
+        }
+    }
+
+    private fun friendly(e: Exception): String {
+        val m = e.message ?: ""
+        return when {
+            m.contains("429") -> "I've hit my limit for now. Give me a minute."
+            m.contains("400") || m.contains("401") || m.contains("403") ->
+                "Something is wrong with my key. Please check it in the app."
+            e is java.net.UnknownHostException || e is java.net.SocketTimeoutException ->
+                "I can't reach the internet right now."
+            else -> "Sorry, I hit a snag. Could you try again?"
+        }
     }
 
     private fun norm(s: String) = s.lowercase().filter { it.isLetterOrDigit() }
 
     private fun findApp(name: String): String? {
-        val want = norm(name.trim().lowercase().removeSuffix(" app"))
+        val want = norm(name.lowercase().trim().removeSuffix(" app"))
         if (want.isEmpty()) return null
         val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        for (r in packageManager.queryIntentActivities(i, 0)) {
-            if (norm(r.loadLabel(packageManager).toString()) == want) return r.activityInfo.packageName
-        }
-        return null
+        val apps = packageManager.queryIntentActivities(i, 0)
+            .map { norm(it.loadLabel(packageManager).toString()) to it.activityInfo.packageName }
+        return apps.firstOrNull { it.first == want }?.second
+            ?: apps.firstOrNull { want.length >= 3 && it.first.startsWith(want) }?.second
     }
 
     private fun launch(pkg: String) {
@@ -183,45 +255,84 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         }
     }
 
-    private fun runAgent(goal: String) {
+    private fun quick(goal: String): Boolean {
+        val t = goal.trim().trimEnd('.', '!', '?')
+        val l = t.lowercase()
+        if (Regex("(stop|cancel|never mind|nevermind|forget it)").matches(l)) { say("Okay."); return true }
+        if (Regex("(go )?back").matches(l)) { performGlobalAction(GLOBAL_ACTION_BACK); return true }
+        if (Regex("(go )?home|go to (the )?home( screen)?").matches(l)) { performGlobalAction(GLOBAL_ACTION_HOME); return true }
+        if (Regex("(show )?(recent apps|recents)").matches(l)) { performGlobalAction(GLOBAL_ACTION_RECENTS); return true }
+        if (l == "scroll down") { swipe("up"); return true }
+        if (l == "scroll up") { swipe("down"); return true }
+        val multi = Regex("\\b(and|then)\\b")
+        val o = Regex("(?:please )?(?:open|launch|start) (.+)", RegexOption.IGNORE_CASE).matchEntire(t)
+        if (o != null && !multi.containsMatchIn(l)) {
+            val name = o.groupValues[1].trim()
+            val pkg = findApp(name)
+            if (pkg != null) {
+                say("Opening $name.")
+                launch(pkg)
+                return true
+            }
+        }
+        val s = Regex("(?:search|google|find|look up|look for)(?: for)?\\s+(.+?)(?:\\s+on\\s+(amazon|flipkart|youtube|google))?",
+            RegexOption.IGNORE_CASE).matchEntire(t)
+        if (s != null && !Regex("\\b(and|then|on|in|from|sort|filter)\\b").containsMatchIn(s.groupValues[1].lowercase())) {
+            val q = Uri.encode(s.groupValues[1].trim())
+            val site = s.groupValues[2].lowercase()
+            val url = when (site) {
+                "amazon" -> "https://www.amazon.in/s?k=$q"
+                "flipkart" -> "https://www.flipkart.com/search?q=$q"
+                "youtube" -> "https://www.youtube.com/results?search_query=$q"
+                else -> "https://www.google.com/search?q=$q"
+            }
+            say("Searching " + (if (site.isEmpty()) "Google" else site.replaceFirstChar { it.uppercase() }) + ".")
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+            return true
+        }
+        return false
+    }
+
+    private fun agent(goal: String, g: Int) {
         val hist = mutableListOf<String>()
-        try {
-            val m = Regex("^(open|launch|start)\\s+(.+)$", RegexOption.IGNORE_CASE).find(goal.trim())
-            if (m != null) {
-                val pkg = findApp(m.groupValues[2])
-                if (pkg != null) {
-                    launch(pkg)
-                    say("Opening " + m.groupValues[2])
+        val apps = appList()
+        say("Okay.")
+        for (step in 1..25) {
+            if (!alive(g)) return
+            val (pkg, els) = readScreen()
+            val a = think(goal, pkg, els, hist, apps, g)
+            if (!alive(g)) return
+            val k = a.optString("action")
+            if (k == "done") { say(a.optString("message", "All done.")); return }
+            if (k == "ask_user") {
+                say(a.optString("message", "Could you tell me a bit more?"))
+                val r = listenOnce(g, true)
+                if (!alive(g)) return
+                if (r.isBlank()) { say("I didn't hear anything, so I'll stop here."); return }
+                hist.add("asked the user, who said: $r")
+                paint(2)
+                continue
+            }
+            if (a.optBoolean("risky")) {
+                say(a.optString("message", "Should I go ahead?"))
+                val r = listenOnce(g, true)
+                if (!alive(g)) return
+                if (!Regex("\\b(yes|yeah|yep|sure|ok|okay|go ahead|do it|haan|ha)\\b")
+                        .containsMatchIn(r.lowercase())) {
+                    say("Okay, I won't.")
                     return
                 }
+                paint(2)
             }
-            for (step in 1..25) {
-                if (!running) return
-                val (pkg, els) = readScreen()
-                val a = think(goal, pkg, els, hist)
-                val k = a.optString("action")
-                if (k == "done") { say(a.optString("message", "Done")); return }
-                if (k == "ask_user") {
-                    say(a.optString("message", "I need your input"))
-                    hist.add("asked: " + a.optString("message") + " | user said: " + listenOnce())
-                    continue
-                }
-                if (a.optBoolean("risky")) {
-                    say("Confirm: " + a.optString("thought") + ". Say yes or no.")
-                    if (!listenOnce().lowercase().contains("yes")) { say("Cancelled"); return }
-                }
-                act(a, els)
-                hist.add(k + " " + a.optString("text") + a.optString("package") +
-                    a.optString("index") + a.optString("key"))
+            hist.add(act(a, els))
+            if (hist.size >= 4 && hist.takeLast(4).distinct().size == 1) {
+                say("I'm a bit stuck. Could you take it from here?")
+                return
             }
-            say("Step limit reached")
-        } catch (e: Exception) {
-            say(if (e.message?.contains("429") == true)
-                "Gemini limit reached. Wait a minute." else "Error: " + e.message)
-        } finally {
-            running = false
-            paint()
         }
+        say("That's taking longer than expected, so I'll stop here.")
     }
 
     private fun appList(): String {
@@ -235,7 +346,7 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         val out = mutableListOf<El>()
         val root = rootInActiveWindow ?: return Pair("unknown", out)
         fun walk(n: AccessibilityNodeInfo?) {
-            if (n == null || out.size >= 80) return
+            if (n == null || out.size >= 70) return
             val t = n.text?.toString() ?: ""
             val d = n.contentDescription?.toString() ?: ""
             if ((t.isNotEmpty() || d.isNotEmpty() || n.isClickable || n.isEditable) && n.isVisibleToUser) {
@@ -253,27 +364,38 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         return Pair(root.packageName?.toString() ?: "unknown", out)
     }
 
-    private fun call(model: String, key: String, body: String): String {
-        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent")
-            .openConnection() as HttpURLConnection
-        c.requestMethod = "POST"
-        c.setRequestProperty("Content-Type", "application/json")
-        c.setRequestProperty("x-goog-api-key", key)
-        c.connectTimeout = 15000
-        c.readTimeout = 45000
-        c.doOutput = true
-        c.outputStream.use { it.write(body.toByteArray()) }
-        val code = c.responseCode
-        if (code !in 200..299) throw Exception("Gemini error $code")
-        return c.inputStream.bufferedReader().readText()
+    private fun call(model: String, key: String, body: JSONObject): String {
+        for (attempt in 0..1) {
+            val b = JSONObject(body.toString())
+            if (attempt == 0) {
+                b.getJSONObject("generationConfig")
+                    .put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+            }
+            val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent")
+                .openConnection() as HttpURLConnection
+            conn = c
+            c.requestMethod = "POST"
+            c.setRequestProperty("Content-Type", "application/json")
+            c.setRequestProperty("x-goog-api-key", key)
+            c.connectTimeout = 15000
+            c.readTimeout = 30000
+            c.doOutput = true
+            c.outputStream.use { it.write(b.toString().toByteArray()) }
+            val code = c.responseCode
+            if (code in 200..299) return c.inputStream.bufferedReader().readText()
+            if (code == 400 && attempt == 0) continue
+            throw Exception("Gemini error $code")
+        }
+        throw Exception("Gemini error 400")
     }
 
-    private fun think(goal: String, pkg: String, els: List<El>, hist: List<String>): JSONObject {
+    private fun think(goal: String, pkg: String, els: List<El>, hist: List<String>,
+                      apps: String, g: Int): JSONObject {
         val key = getSharedPreferences("m", MODE_PRIVATE).getString("key", "") ?: ""
         val ui = els.joinToString("\n") {
-            "${it.i}|${it.text}|${it.desc}|${it.id}|click=${it.click}|edit=${it.edit}"
+            "${it.i}|${it.text}|${it.desc}|${it.id.take(24)}|${if (it.click) "c" else ""}${if (it.edit) "e" else ""}"
         }
-        val prompt = "GOAL: $goal\nCURRENT APP: $pkg\nAPPS: ${appList()}\nHISTORY: ${hist.takeLast(8)}\nSCREEN:\n$ui"
+        val prompt = "GOAL: $goal\nCURRENT APP: $pkg\nAPPS: $apps\nDONE SO FAR: ${hist.takeLast(8)}\nSCREEN:\n$ui"
         val body = JSONObject()
             .put("system_instruction", JSONObject().put("parts",
                 JSONArray().put(JSONObject().put("text", SYS))))
@@ -281,7 +403,6 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
                 JSONArray().put(JSONObject().put("text", prompt)))))
             .put("generationConfig", JSONObject()
                 .put("responseMimeType", "application/json").put("temperature", 0.2))
-            .toString()
         var txt: String? = null
         var last: Exception? = null
         loop@ for (m in MODELS) {
@@ -290,35 +411,68 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
                     txt = call(m, key, body)
                     break@loop
                 } catch (e: Exception) {
+                    if (!alive(g)) throw e
                     last = e
-                    if (e.message?.contains("503") != true) break
-                    Thread.sleep(1000)
+                    val msg = e.message ?: ""
+                    if (msg.contains("503") || msg.contains("500")) Thread.sleep(500) else break
                 }
             }
         }
-        if (txt == null) throw last ?: Exception("Gemini failed")
-        val t = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
+        val raw = txt ?: throw (last ?: Exception("Gemini failed"))
+        val t = JSONObject(raw).getJSONArray("candidates").getJSONObject(0)
             .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
         return JSONObject(t)
     }
 
-    private fun act(a: JSONObject, els: List<El>) {
-        when (a.optString("action")) {
-            "open_app" -> launch(a.optString("package"))
+    private fun settle(maxMs: Long) {
+        val start = SystemClock.uptimeMillis()
+        Thread.sleep(120)
+        while (SystemClock.uptimeMillis() - start < maxMs) {
+            if (SystemClock.uptimeMillis() - lastEvt >= 280) return
+            Thread.sleep(40)
+        }
+    }
+
+    private fun act(a: JSONObject, els: List<El>): String {
+        return when (a.optString("action")) {
+            "open_app" -> {
+                launch(a.optString("package"))
+                settle(2800)
+                "opened " + a.optString("package")
+            }
             "tap" -> {
                 val e = els.getOrNull(a.optInt("index", -1))
-                if (e != null) tap(e.x, e.y)
+                if (e != null) {
+                    tap(e.x, e.y)
+                    settle(1600)
+                    "tapped " + e.text.ifEmpty { e.desc }.ifEmpty { e.id }
+                } else "tap failed: bad index"
             }
-            "type" -> typeText(a.optString("text"))
-            "key" -> when (a.optString("key")) {
-                "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
-                "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
-                "enter" -> pressEnter()
-                else -> performGlobalAction(GLOBAL_ACTION_BACK)
+            "type" -> {
+                typeText(a.optString("text"))
+                settle(600)
+                "typed " + a.optString("text")
             }
-            "swipe" -> swipe(a.optString("direction"))
+            "key" -> {
+                when (a.optString("key")) {
+                    "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+                    "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                    "enter" -> pressEnter()
+                    else -> performGlobalAction(GLOBAL_ACTION_BACK)
+                }
+                settle(1600)
+                "pressed " + a.optString("key")
+            }
+            "swipe" -> {
+                swipe(a.optString("direction"))
+                settle(1200)
+                "swiped " + a.optString("direction")
+            }
+            else -> {
+                Thread.sleep(500)
+                "waited"
+            }
         }
-        Thread.sleep(1000)
     }
 
     private fun gesture(p: Path, dur: Long) {
@@ -334,8 +488,8 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
 
     private fun tap(x: Int, y: Int) {
         val p = Path()
-        p.moveTo(x.toFloat(), y.toFloat())
-        gesture(p, 50)
+        p.moveTo((x + (-3..3).random()).toFloat(), (y + (-3..3).random()).toFloat())
+        gesture(p, (45..85).random().toLong())
     }
 
     private fun swipe(d: String) {
@@ -349,7 +503,7 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
             "right" -> { p.moveTo(w * 0.2f, h / 2); p.lineTo(w * 0.8f, h / 2) }
             else -> { p.moveTo(w / 2, h * 0.75f); p.lineTo(w / 2, h * 0.3f) }
         }
-        gesture(p, 300)
+        gesture(p, (240..340).random().toLong())
     }
 
     private fun firstEditable(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
