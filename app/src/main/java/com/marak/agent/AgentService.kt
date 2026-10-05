@@ -37,7 +37,7 @@ class AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
     class El(val i: Int, val text: String, val desc: String, val id: String,
              val click: Boolean, val edit: Boolean, val x: Int, val y: Int)
 
-    private val MODEL = "gemini-flash-latest"
+    private val MODELS = listOf("gemini-3.1-flash-lite", "gemini-flash-latest")
 
     private val main = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
@@ -49,7 +49,7 @@ class AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
 Each turn you get the current app, installed apps (label:package) and the visible screen elements (index|text|desc|id|click|edit).
 Reply ONLY with one JSON object: {"thought":"short","action":"","index":0,"text":"","package":"","key":"","direction":"","risky":false,"message":""}
 Actions: open_app(package) | tap(index) | type(text) | key(back|home|recents|enter) | swipe(direction up|down|left|right) | wait | ask_user(message) | done(message).
-Rules: tap a search field before typing. After typing a search, use key enter. swipe up scrolls the page down. Set risky=true for anything that buys, pays, sends, posts, deletes or changes account settings. Never enter passwords or OTPs: use ask_user. If the screen list is empty the app may block reading: use done and tell the user. Use done when finished and summarize in message."""
+Rules: tap a search field before typing. After typing a search, use key enter. swipe up scrolls the page down. Set risky=true for anything that buys, pays, sends, posts, deletes or changes account settings. Never enter passwords or OTPs: use ask_user. If the screen list is empty the app may block reading: use done and tell the user. Use done when finished and summarize in message. Keep thought under 8 words."""
 
     override fun onServiceConnected() {
         instance = this
@@ -163,9 +163,38 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         Thread { runAgent(goal) }.start()
     }
 
+    private fun norm(s: String) = s.lowercase().filter { it.isLetterOrDigit() }
+
+    private fun findApp(name: String): String? {
+        val want = norm(name.trim().lowercase().removeSuffix(" app"))
+        if (want.isEmpty()) return null
+        val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        for (r in packageManager.queryIntentActivities(i, 0)) {
+            if (norm(r.loadLabel(packageManager).toString()) == want) return r.activityInfo.packageName
+        }
+        return null
+    }
+
+    private fun launch(pkg: String) {
+        val i = packageManager.getLaunchIntentForPackage(pkg)
+        if (i != null) {
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+        }
+    }
+
     private fun runAgent(goal: String) {
         val hist = mutableListOf<String>()
         try {
+            val m = Regex("^(open|launch|start)\\s+(.+)$", RegexOption.IGNORE_CASE).find(goal.trim())
+            if (m != null) {
+                val pkg = findApp(m.groupValues[2])
+                if (pkg != null) {
+                    launch(pkg)
+                    say("Opening " + m.groupValues[2])
+                    return
+                }
+            }
             for (step in 1..25) {
                 if (!running) return
                 val (pkg, els) = readScreen()
@@ -224,6 +253,21 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
         return Pair(root.packageName?.toString() ?: "unknown", out)
     }
 
+    private fun call(model: String, key: String, body: String): String {
+        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent")
+            .openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.setRequestProperty("Content-Type", "application/json")
+        c.setRequestProperty("x-goog-api-key", key)
+        c.connectTimeout = 15000
+        c.readTimeout = 45000
+        c.doOutput = true
+        c.outputStream.use { it.write(body.toByteArray()) }
+        val code = c.responseCode
+        if (code !in 200..299) throw Exception("Gemini error $code")
+        return c.inputStream.bufferedReader().readText()
+    }
+
     private fun think(goal: String, pkg: String, els: List<El>, hist: List<String>): JSONObject {
         val key = getSharedPreferences("m", MODE_PRIVATE).getString("key", "") ?: ""
         val ui = els.joinToString("\n") {
@@ -237,18 +281,22 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
                 JSONArray().put(JSONObject().put("text", prompt)))))
             .put("generationConfig", JSONObject()
                 .put("responseMimeType", "application/json").put("temperature", 0.2))
-        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent")
-            .openConnection() as HttpURLConnection
-        c.requestMethod = "POST"
-        c.setRequestProperty("Content-Type", "application/json")
-        c.setRequestProperty("x-goog-api-key", key)
-        c.connectTimeout = 20000
-        c.readTimeout = 60000
-        c.doOutput = true
-        c.outputStream.use { it.write(body.toString().toByteArray()) }
-        val code = c.responseCode
-        if (code !in 200..299) throw Exception("Gemini error $code")
-        val txt = c.inputStream.bufferedReader().readText()
+            .toString()
+        var txt: String? = null
+        var last: Exception? = null
+        loop@ for (m in MODELS) {
+            for (t in 1..2) {
+                try {
+                    txt = call(m, key, body)
+                    break@loop
+                } catch (e: Exception) {
+                    last = e
+                    if (e.message?.contains("503") != true) break
+                    Thread.sleep(1000)
+                }
+            }
+        }
+        if (txt == null) throw last ?: Exception("Gemini failed")
         val t = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
             .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
         return JSONObject(t)
@@ -256,13 +304,7 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
 
     private fun act(a: JSONObject, els: List<El>) {
         when (a.optString("action")) {
-            "open_app" -> {
-                val i = packageManager.getLaunchIntentForPackage(a.optString("package"))
-                if (i != null) {
-                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    startActivity(i)
-                }
-            }
+            "open_app" -> launch(a.optString("package"))
             "tap" -> {
                 val e = els.getOrNull(a.optInt("index", -1))
                 if (e != null) tap(e.x, e.y)
@@ -276,7 +318,7 @@ Rules: tap a search field before typing. After typing a search, use key enter. s
             }
             "swipe" -> swipe(a.optString("direction"))
         }
-        Thread.sleep(1500)
+        Thread.sleep(1000)
     }
 
     private fun gesture(p: Path, dur: Long) {
