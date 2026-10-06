@@ -10,23 +10,29 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
-import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.provider.AlarmClock
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.util.Base64
+import android.view.Display
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -36,8 +42,11 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -61,17 +70,23 @@ class AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         "notifications", "voice", "talk", "speak", "be", "sleep", "mic", "unpause", "continue",
         "add", "create", "delete", "remove", "switch", "enable", "disable", "post", "follow",
         "unfollow", "save", "select", "check", "book", "order", "buy", "make", "navigate",
-        "record", "upload", "fill", "enter", "scan", "pay", "reply", "no")
+        "record", "upload", "fill", "enter", "scan", "pay", "no", "what", "what's", "whats",
+        "who", "who's", "when", "where", "why", "how", "which", "tell", "explain", "define",
+        "weather", "news", "remember", "remind", "directions", "route", "alarm", "timer",
+        "summarize", "summarise", "drive", "wifi", "bluetooth", "normal", "double", "faster")
+
+    private val SENSITIVE = Regex(
+        "\\b(send|pay|pay now|buy now|place order|order now|confirm order|transfer|delete|remove|" +
+            "post|publish|call|checkout|purchase|donate|subscribe|submit|uninstall)\\b")
 
     private val VIDEO_APPS = listOf("youtube", "instagram", "facebook", "netflix", "hotstar",
-        "avod", "mxtech", "vlc", "snapchat", "musically", "tiktok", "primevideo", "sonyliv", "zee5")
+        "mxtech", "vlc", "snapchat", "tiktok", "primevideo", "sonyliv", "zee5")
 
     private val main = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
     private var btn: TextView? = null
     private var bar: TextView? = null
     private var rec: SpeechRecognizer? = null
-    private val tone by lazy { ToneGenerator(AudioManager.STREAM_MUSIC, 60) }
 
     @Volatile private var gen = 0
     @Volatile private var lastEvt = 0L
@@ -80,26 +95,54 @@ class AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
     @Volatile private var waiting = false
     @Volatile private var answer = ""
     @Volatile private var answerLatch: CountDownLatch? = null
+    @Volatile private var speakUntil = 0L
+    @Volatile private var convUntil = 0L
+    private var pending = ""
+    private var onDevice = true
     private var fg = false
 
     private fun alive(g: Int) = g == gen
 
     private val SYS = """You are MARAK, a fast, polite phone assistant. You operate an Android phone for the user the way a skilled person would. Work step by step toward the goal.
-Each turn you see the current app, the installed apps (label:package) and the screen elements (index|text|desc|id|flags where c=clickable e=editable).
+Each turn you see the goal, MEMORY (facts about the user), the current app, the installed apps (label:package) and the screen elements (index|text|desc|id|flags where c=clickable e=editable). Sometimes you also get a screenshot.
 Reply ONLY with one JSON object: {"action":"","index":0,"text":"","package":"","key":"","direction":"","risky":false,"message":""}
 Actions: open_app(package) | tap(index) | type(text) | key(back|home|recents|enter) | swipe(direction up|down|left|right) | wait | ask_user(message) | done(message).
 Rules:
 - Take the shortest path. Do not reopen an app that is already open. Prefer search boxes over scrolling.
 - Tap a search field before typing, then use key enter.
 - swipe up scrolls the page down.
+- Use MEMORY when relevant, for example names and relationships.
+- Check the new screen after each action before deciding the next one. Only finish when the goal is truly done.
 - To play a video on YouTube: search, then tap the first real video result, not an ad and not a Short.
-- To change YouTube playback speed: open the player menu (gear or three dots), then Playback speed.
+- To change YouTube playback speed: open the player settings (gear or three dots), then Playback speed.
 - Do exactly what the user asked and nothing extra. If the request is unclear, use ask_user with one short question.
 - Set risky=true for anything that buys, pays, sends, posts, calls, deletes or changes settings, and put a short natural yes/no question in message, like: Should I send it to Rahul?
 - Never enter passwords or OTPs: use ask_user.
 - If the screen is empty or blocked, use done and say so.
-- message is shown on screen: one or two short, warm, natural sentences in first person, no technical words, no emojis, no lists.
+- message is shown to the user: one or two short, warm, natural sentences in first person, no technical words, no emojis, no lists.
 - When finished, use done."""
+
+    private val ASK_SYS = """You are Marak, a friendly phone assistant. Answer in one to three short, natural, spoken sentences. No markdown, no lists, no emojis. If a screenshot is given, answer about what is on the screen. Be accurate and say so if you are unsure."""
+
+    // ---------- storage helpers ----------
+
+    private fun getP() = getSharedPreferences("m", MODE_PRIVATE)
+
+    private fun log(s: String) {
+        val line = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date()) + "  " + s
+        val all = (getP().getString("log", "") ?: "").split("\n").filter { it.isNotBlank() }.toMutableList()
+        all.add(line)
+        getP().edit().putString("log", all.takeLast(60).joinToString("\n")).apply()
+    }
+
+    private fun facts(): List<String> =
+        (getP().getString("facts", "") ?: "").split("\n").filter { it.isNotBlank() }
+
+    private fun setFacts(l: List<String>) =
+        getP().edit().putString("facts", l.takeLast(100).joinToString("\n")).apply()
+
+    private fun voiceOn() = getP().getBoolean("voice", false)
+    private fun setVoice(v: Boolean) = getP().edit().putBoolean("voice", v).apply()
 
     // ---------- lifecycle ----------
 
@@ -110,13 +153,21 @@ Rules:
         addBar()
         goForeground()
         paint(1)
-        show("Marak is listening.", 2500)
         restart(300)
     }
 
     override fun onInit(status: Int) {
-        tts?.language = Locale.getDefault()
-        tts?.setSpeechRate(1.0f)
+        val t = tts ?: return
+        t.language = Locale.forLanguageTag("en-IN")
+        try {
+            val best = t.voices?.filter { it.locale.language == "en" }
+                ?.maxByOrNull {
+                    it.quality + (if (it.locale.country == "IN") 100 else 0) -
+                        (if (it.features?.contains("notInstalled") == true) 1000 else 0)
+                }
+            if (best != null) t.voice = best
+        } catch (e: Exception) {}
+        t.setSpeechRate(1.05f)
     }
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) { lastEvt = SystemClock.uptimeMillis() }
@@ -153,7 +204,7 @@ Rules:
         } catch (e: Exception) {}
     }
 
-    // ---------- overlay: button + text bar ----------
+    // ---------- overlay ----------
 
     private fun addButton() {
         if (btn != null) return
@@ -205,7 +256,7 @@ Rules:
 
     private val hideBar = Runnable { bar?.visibility = View.GONE }
 
-    private fun show(t: String, ms: Long = 3500) {
+    private fun card(t: String, ms: Long = 5000) {
         main.post {
             val b = bar ?: return@post
             b.text = t
@@ -224,42 +275,58 @@ Rules:
         main.post { (btn?.background as? GradientDrawable)?.setColor(Color.parseColor(c)) }
     }
 
-    private fun voiceOn() = getSharedPreferences("m", MODE_PRIVATE).getBoolean("voice", false)
-    private fun setVoice(v: Boolean) =
-        getSharedPreferences("m", MODE_PRIVATE).edit().putBoolean("voice", v).apply()
+    private fun tick(n: Int = 1) {
+        try {
+            val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (n == 1) {
+                v.vibrate(VibrationEffect.createOneShot(18, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 25, 60, 25), -1))
+            }
+        } catch (e: Exception) {}
+    }
 
     private fun speak(t: String) {
-        if (voiceOn()) tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "m")
+        if (!voiceOn()) return
+        speakUntil = SystemClock.uptimeMillis() + t.length * 70L + 700L
+        tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "m")
     }
 
-    private fun say(t: String, ms: Long = 4000) {
-        show(t, ms)
+    private fun reply(t: String) {
+        card(t, 9000)
         speak(t)
-    }
-
-    private fun attention() {
-        try { tone.startTone(ToneGenerator.TONE_PROP_ACK, 120) } catch (e: Exception) {}
+        log("Marak: " + t.take(80))
     }
 
     private fun togglePause() {
         if (paused) {
             paused = false
             paint(1)
-            show("Listening.", 1500)
+            tick()
             restart(0)
         } else {
             paused = true
             main.removeCallbacks(restartRun)
+            main.removeCallbacks(partialRun)
             try { rec?.destroy() } catch (e: Exception) {}
             rec = null
             paint(3)
-            show("Mic paused. Tap the button to resume.", 3000)
+            tick(2)
         }
     }
 
     // ---------- continuous listening ----------
 
     private val restartRun = Runnable { startRec() }
+
+    private val partialRun = Runnable {
+        val t = pending
+        if (t.isNotBlank()) {
+            pending = ""
+            consume(t)
+            restart(0)
+        }
+    }
 
     private fun restart(ms: Long) {
         main.removeCallbacks(restartRun)
@@ -269,32 +336,55 @@ Rules:
     private fun micOk() =
         checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
+    private fun newRecognizer(): SpeechRecognizer {
+        if (onDevice && Build.VERSION.SDK_INT >= 31 &&
+            SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
+            return SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+        }
+        return SpeechRecognizer.createSpeechRecognizer(this)
+    }
+
     private fun startRec() {
         if (paused) return
         if (!micOk()) {
-            show("Please allow the microphone in the Marak app.", 4000)
+            card("Please allow the microphone in the Marak app.", 4000)
             restart(4000)
             return
         }
         goForeground()
         try {
             rec?.destroy()
-            val r = SpeechRecognizer.createSpeechRecognizer(this)
+            val r = newRecognizer()
             rec = r
             r.setRecognitionListener(object : RecognitionListener {
                 override fun onResults(b: Bundle?) {
+                    main.removeCallbacks(partialRun)
+                    pending = ""
                     val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull() ?: ""
-                    if (t.isNotBlank()) onHeard(t)
-                    restart(120)
+                    if (t.isNotBlank()) consume(t)
+                    restart(0)
+                }
+                override fun onPartialResults(b: Bundle?) {
+                    val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull() ?: return
+                    if (t.isBlank()) return
+                    pending = t
+                    val s = clean(t).first
+                    val quick = !waiting && s.split(" ").size <= 4 && match(s) != null
+                    main.removeCallbacks(partialRun)
+                    main.postDelayed(partialRun, if (waiting) 700L else if (quick) 320L else 800L)
                 }
                 override fun onError(error: Int) {
+                    main.removeCallbacks(partialRun)
+                    val t = pending
+                    pending = ""
+                    if (t.isNotBlank()) consume(t)
                     when (error) {
-                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> restart(4000)
-                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> restart(1200)
-                        SpeechRecognizer.ERROR_NO_MATCH,
-                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> restart(150)
-                        else -> restart(700)
+                        12, 13 -> { onDevice = false; restart(200) }
+                        9 -> restart(4000)
+                        8 -> restart(1000)
+                        else -> restart(150)
                     }
                 }
                 override fun onReadyForSpeech(p: Bundle?) {}
@@ -302,15 +392,16 @@ Rules:
                 override fun onRmsChanged(v: Float) {}
                 override fun onBufferReceived(b: ByteArray?) {}
                 override fun onEndOfSpeech() {}
-                override fun onPartialResults(b: Bundle?) {}
                 override fun onEvent(t: Int, b: Bundle?) {}
             })
             val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
-            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
-            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
+            i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
             r.startListening(i)
         } catch (e: Exception) {
             restart(1500)
@@ -333,8 +424,8 @@ Rules:
         return Pair(s, addressed)
     }
 
-    private fun onHeard(raw: String) {
-        if (tts?.isSpeaking == true) return
+    private fun consume(raw: String) {
+        if (SystemClock.uptimeMillis() < speakUntil || tts?.isSpeaking == true) return
         if (waiting) {
             answer = raw
             answerLatch?.countDown()
@@ -344,21 +435,26 @@ Rules:
         handle(s, addressed)
     }
 
-    private fun handle(s: String, addressed: Boolean) {
+    private fun handle(s: String, addressed0: Boolean) {
         if (s.isBlank()) return
+        val now = SystemClock.uptimeMillis()
+        val addressed = addressed0 || now < convUntil
+        if (addressed0) convUntil = now + 8000
+        if (getP().getBoolean("wake", false) && !addressed) return
         val words = s.split(" ").size
         val first = s.substringBefore(" ")
         if (!addressed && (words > 14 || first !in STARTERS)) return
-        val act = match(s)
-        if (act != null) {
-            show("\u25B6 $s", 2500)
-            val g = interrupt()
-            Thread { runTask { act(g) } }.start()
-        } else {
+        val cmd = match(s)
+        if (cmd == null) {
             val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             if (!addressed && am.isMusicActive) return
-            show("\u25B6 $s", 2500)
-            val g = interrupt()
+        }
+        tick()
+        log(s)
+        val g = interrupt()
+        if (cmd != null) {
+            Thread { runTask { cmd(g) } }.start()
+        } else {
             Thread { runTask { agent(s, g) } }.start()
         }
     }
@@ -371,6 +467,7 @@ Rules:
     private fun interrupt(): Int {
         val g = ++gen
         tts?.stop()
+        speakUntil = 0L
         val c = conn
         if (c != null) Thread { try { c.disconnect() } catch (e: Exception) {} }.start()
         return g
@@ -382,7 +479,10 @@ Rules:
         try {
             body()
         } catch (e: Exception) {
-            if (alive(g)) show(friendly(e), 5000)
+            if (alive(g)) {
+                tick(2)
+                card(friendly(e), 5000)
+            }
         } finally {
             if (alive(g)) paint(if (paused) 3 else 1)
         }
@@ -415,8 +515,8 @@ Rules:
 
     private fun ask(q: String, g: Int): String {
         waiting = true
-        show(q, 20000)
-        attention()
+        card(q, 20000)
+        tick(2)
         speak(q)
         val a = waitAnswer(g, 20000)
         main.post(hideBar)
@@ -435,24 +535,142 @@ Rules:
         else -> ""
     }
 
+    private fun tryStart(i: Intent): Boolean {
+        return try {
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun timer(secs: Int, msg: String) {
+        val i = Intent(AlarmClock.ACTION_SET_TIMER)
+        i.putExtra(AlarmClock.EXTRA_LENGTH, secs.coerceIn(1, 86400))
+        i.putExtra(AlarmClock.EXTRA_MESSAGE, msg)
+        i.putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+        tryStart(i)
+    }
+
     private fun match(l: String): ((Int) -> Unit)? {
-        if (Regex("cancel|never mind|nevermind|forget it|enough").matches(l))
-            return { _ -> show("Okay.", 1500) }
+        val l2 = l.replace(".", "")
+
+        if (Regex("cancel|never mind|nevermind|forget it|enough|stop scrolling|stop scroll").matches(l))
+            return { _ -> }
 
         if (Regex("(stop|pause) listening|go to sleep|sleep|mic off").matches(l))
             return { _ -> main.post { if (!paused) togglePause() } }
 
         if (Regex("voice on|talk to me|speak to me|reply with voice").matches(l))
-            return { _ -> setVoice(true); say("Voice replies are on.") }
+            return { _ -> setVoice(true); reply("Voice replies are on.") }
 
         if (Regex("voice off|be quiet|stop talking|no voice|silent mode").matches(l))
-            return { _ -> setVoice(false); show("Voice replies are off.", 2500) }
+            return { _ -> setVoice(false); card("Voice replies are off.", 2000) }
 
+        // memory
+        val rem = Regex("remember (?:that )?(.+)").matchEntire(l)
+        if (rem != null && !l.startsWith("remember to")) return { _ ->
+            setFacts(facts() + rem.groupValues[1])
+            card("Remembered.", 2000)
+        }
+        if (Regex("what do you (remember|know)( about me)?|show (my )?memory").matches(l))
+            return { _ ->
+                val f = facts()
+                reply(if (f.isEmpty()) "I don't have anything saved yet." else f.joinToString(". "))
+            }
+        val fg2 = Regex("forget (?:that )?(.+)").matchEntire(l)
+        if (fg2 != null) return { _ ->
+            val x = fg2.groupValues[1]
+            if (x == "everything" || x == "all") setFacts(emptyList())
+            else setFacts(facts().filter { !it.lowercase().contains(x) })
+            card("Done.", 2000)
+        }
+
+        // time and date
+        if (Regex("(what('s| is) the )?time( now)?|what time is it").matches(l))
+            return { _ -> reply("It's " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())) }
+        if (Regex("(what('s| is) )?(today's |the )?date( today)?|what day is it").matches(l))
+            return { _ -> reply(SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(Date())) }
+
+        // skills
+        val nv = Regex("(?:navigate to|navigation to|directions to|route to|take me to|drive to) (.+)").matchEntire(l)
+        if (nv != null) return { _ ->
+            val d = Uri.encode(nv.groupValues[1])
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$d"))
+            i.setPackage("com.google.android.apps.maps")
+            if (!tryStart(i)) viewUrl("https://www.google.com/maps/dir/?api=1&destination=$d", emptyList())
+        }
+
+        val al = Regex("(?:set )?(?:an? )?alarm (?:for|at) (\\d{1,2})(?:[: ](\\d{2}))? ?(am|pm)?").matchEntire(l2)
+        if (al != null) return { _ ->
+            var h = al.groupValues[1].toInt()
+            val mi = al.groupValues[2].ifEmpty { "0" }.toInt()
+            val ap = al.groupValues[3]
+            if (ap == "pm" && h < 12) h += 12
+            if (ap == "am" && h == 12) h = 0
+            val i = Intent(AlarmClock.ACTION_SET_ALARM)
+            i.putExtra(AlarmClock.EXTRA_HOUR, h.coerceIn(0, 23))
+            i.putExtra(AlarmClock.EXTRA_MINUTES, mi.coerceIn(0, 59))
+            i.putExtra(AlarmClock.EXTRA_MESSAGE, "Marak")
+            i.putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+            tryStart(i)
+            card("Alarm set for " + h.coerceIn(0, 23) + ":" + mi.coerceIn(0, 59).toString().padStart(2, '0'), 3000)
+        }
+
+        val tm = Regex("(?:set )?(?:a |an )?timer (?:for )?(\\d+) (second|minute|hour)s?").matchEntire(l)
+        if (tm != null) return { _ ->
+            val n = tm.groupValues[1].toInt()
+            val secs = n * (if (tm.groupValues[2] == "hour") 3600 else if (tm.groupValues[2] == "minute") 60 else 1)
+            timer(secs, "Marak")
+            card("Timer set.", 2000)
+        }
+
+        val rm = Regex("remind me (?:in|after) (\\d+) (minute|hour)s? to (.+)").matchEntire(l)
+        if (rm != null) return { _ ->
+            val n = rm.groupValues[1].toInt()
+            timer(n * (if (rm.groupValues[2] == "hour") 3600 else 60), rm.groupValues[3])
+            card("I'll remind you.", 2000)
+        }
+        val rm2 = Regex("remind me to (.+) (?:in|after) (\\d+) (minute|hour)s?").matchEntire(l)
+        if (rm2 != null) return { _ ->
+            val n = rm2.groupValues[2].toInt()
+            timer(n * (if (rm2.groupValues[3] == "hour") 3600 else 60), rm2.groupValues[1])
+            card("I'll remind you.", 2000)
+        }
+
+        val st = Regex("(?:open )?(wi-?fi|bluetooth|battery|display|sound|location|airplane( mode)?|mobile data|accessibility) settings").matchEntire(l)
+        if (st != null) return { _ ->
+            val a = when (st.groupValues[1].replace("-", "")) {
+                "wifi" -> Settings.ACTION_WIFI_SETTINGS
+                "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+                "battery" -> Settings.ACTION_BATTERY_SAVER_SETTINGS
+                "display" -> Settings.ACTION_DISPLAY_SETTINGS
+                "sound" -> Settings.ACTION_SOUND_SETTINGS
+                "location" -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+                "mobile data" -> Settings.ACTION_WIRELESS_SETTINGS
+                "accessibility" -> Settings.ACTION_ACCESSIBILITY_SETTINGS
+                else -> Settings.ACTION_AIRPLANE_MODE_SETTINGS
+            }
+            tryStart(Intent(a))
+        }
+
+        val cn = Regex("call (\\+?\\d[\\d ]{5,})").matchEntire(l)
+        if (cn != null) return { _ ->
+            tryStart(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + cn.groupValues[1].replace(" ", ""))))
+        }
+
+        // media
         if (Regex("(stop|pause)( (the )?(video|music|song|playing|playback|it|this|that))?|hold on|wait").matches(l))
             return { _ -> pauseMedia() }
 
         if (Regex("(play|resume|continue|unpause|start)( (the )?(video|music|song|playing|playback|it|this|that|again))?").matches(l))
             return { _ -> playMedia() }
+
+        if (Regex("(play |go )?(at )?(fast|faster|2x|double speed|speed up|fast forward)( (the )?(video|speed))?").matches(l))
+            return { g -> agent("In the video player that is open, open the player settings (gear or three dots), choose Playback speed and select 2x. Then finish.", g) }
+        if (Regex("(play |go )?(at )?(normal|regular|1x)( speed)?|back to normal|stop fast forward(ing)?|normal speed").matches(l))
+            return { g -> agent("In the video player that is open, open the player settings (gear or three dots), choose Playback speed and select Normal (1x). Then finish.", g) }
 
         if (Regex("(go )?back").matches(l)) return { _ -> performGlobalAction(GLOBAL_ACTION_BACK) }
         if (Regex("(go )?home|go to (the )?home( screen)?").matches(l))
@@ -511,16 +729,20 @@ Rules:
         }
         if (l == "scroll") return { _ -> swipe("up") }
 
-        val au = Regex("(keep scrolling|auto ?scroll|start scrolling|scroll automatically|scroll continuously|keep swiping)( every (\\d+) seconds?)?").matchEntire(l)
+        val au = Regex("(?:keep scrolling|auto ?scroll|start scrolling|scroll automatically|scroll continuously|keep swiping|scroll (?:the )?reels?|scroll (?:the )?shorts?)(?: every (\\d+) seconds?)?").matchEntire(l)
         if (au != null) return { g ->
-            val sec = (au.groupValues[3].toIntOrNull() ?: 7).coerceIn(2, 60)
-            show("Scrolling every $sec seconds. Say stop to end.", 4000)
+            val sec = (au.groupValues[1].toIntOrNull() ?: 7).coerceIn(2, 60)
             while (alive(g)) {
                 swipe("up")
                 if (!nap(sec * 1000L, g)) break
             }
         }
 
+        // screen vision
+        if (Regex(".*\\b(on (my |the )?screen|this page|this screen|this (message|email|error|post|image|picture|photo|video|article)|read (this|it|the screen)|what does this say|what is this|explain this|summari[sz]e this|why am i getting).*").matches(l))
+            return { g -> askScreen(l, g) }
+
+        // open / search
         val oc = Regex("open (youtube|amazon|flipkart|google|chrome) and (search|find|look up|play|watch)(?: for)? (.+)").matchEntire(l)
         if (oc != null) return { g ->
             doSearch(oc.groupValues[3], oc.groupValues[1].replace("chrome", "google"),
@@ -532,12 +754,15 @@ Rules:
             val name = o.groupValues[1].trim()
             if (findApp(name) != null) return { _ ->
                 val p = findApp(name)
-                if (p != null) {
-                    show("Opening $name.", 1500)
-                    launch(p)
-                }
+                if (p != null) launch(p)
             }
         }
+
+        // web answers
+        if (Regex("(search|look up|find)( for)? (the )?(internet|web) .+").matches(l) ||
+            Regex("(what|what's|whats|who|who's|when|where|why|how|which|tell me|explain|define|is|are|does|do|can|will|should) .+").matches(l) ||
+            Regex("weather.*|news.*|.*\\bweather\\b.*").matches(l))
+            return { g -> answerQ(l, g) }
 
         val s = Regex("(search|google|find|look up|look for)(?: for)? (.+?)(?: on (amazon|flipkart|youtube|google))?").matchEntire(l)
         if (s != null && !Regex("\\b(and|then)\\b").containsMatchIn(s.groupValues[2])) return { g ->
@@ -584,7 +809,6 @@ Rules:
         if (am.isMusicActive && isVideoApp(p)) {
             tap(resources.displayMetrics.widthPixels / 2, playerY(p).toInt())
         }
-        show("Paused.", 1200)
     }
 
     private fun playMedia() {
@@ -601,14 +825,13 @@ Rules:
     private fun seek(right: Boolean, l: String, g: Int) {
         val p = curPkg()
         if (p.contains("instagram")) {
-            show("I can't seek in reels.", 2000)
+            card("I can't seek in reels.", 2000)
             return
         }
         val sec = Regex("\\d+").find(l)?.value?.toIntOrNull() ?: 10
         val taps = ((sec + 5) / 10).coerceIn(1, 6)
         val x = resources.displayMetrics.widthPixels * (if (right) 0.82f else 0.18f)
         val y = playerY(p)
-        show((if (right) "Forward " else "Back ") + (taps * 10) + " seconds", 1500)
         for (i in 1..taps) {
             if (!alive(g)) return
             doubleTap(x, y)
@@ -619,13 +842,10 @@ Rules:
     private fun skipAd(g: Int) {
         for (i in 1..20) {
             if (!alive(g)) return
-            if (clickByText("skip ad", "skip")) {
-                show("Skipped.", 1200)
-                return
-            }
+            if (clickByText("skip ad", "skip")) return
             if (!nap(400, g)) return
         }
-        show("I don't see a skip button yet.", 2500)
+        card("I don't see a skip button yet.", 2500)
     }
 
     private fun clickByText(vararg words: String): Boolean {
@@ -679,7 +899,6 @@ Rules:
             "youtube" -> Pair("https://www.youtube.com/results?search_query=$e", listOf("com.google.android.youtube"))
             else -> Pair("https://www.google.com/search?q=$e", emptyList<String>())
         }
-        show("Searching " + site.replaceFirstChar { it.uppercase() } + " for " + query + "\u2026", 2500)
         viewUrl(url, pkgs)
         if (playFirst) {
             settle(3000)
@@ -690,17 +909,11 @@ Rules:
 
     private fun viewUrl(url: String, pkgs: List<String>) {
         for (p in pkgs) {
-            try {
-                val i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                i.setPackage(p)
-                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(i)
-                return
-            } catch (e: Exception) {}
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            i.setPackage(p)
+            if (tryStart(i)) return
         }
-        val i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        startActivity(i)
+        tryStart(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     }
 
     private fun norm(s: String) = s.lowercase().filter { it.isLetterOrDigit() }
@@ -717,10 +930,57 @@ Rules:
 
     private fun launch(pkg: String) {
         val i = packageManager.getLaunchIntentForPackage(pkg)
-        if (i != null) {
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(i)
-        }
+        if (i != null) tryStart(i)
+    }
+
+    // ---------- vision and answers ----------
+
+    private fun shot(): String? {
+        if (Build.VERSION.SDK_INT < 30) return null
+        val latch = CountDownLatch(1)
+        var out: String? = null
+        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
+            object : AccessibilityService.TakeScreenshotCallback {
+                override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                    try {
+                        val hb = r.hardwareBuffer
+                        val bmp = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)
+                        if (bmp != null) {
+                            val sw = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                            val h = (sw.height * 720f / sw.width).toInt()
+                            val small = Bitmap.createScaledBitmap(sw, 720, h, true)
+                            val bos = ByteArrayOutputStream()
+                            small.compress(Bitmap.CompressFormat.JPEG, 60, bos)
+                            out = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+                        }
+                        hb.close()
+                    } catch (e: Exception) {}
+                    latch.countDown()
+                }
+                override fun onFailure(code: Int) { latch.countDown() }
+            })
+        latch.await(3, TimeUnit.SECONDS)
+        return out
+    }
+
+    private fun imgPart(b64: String) = JSONObject().put("inline_data",
+        JSONObject().put("mime_type", "image/jpeg").put("data", b64))
+
+    private fun askScreen(q: String, g: Int) {
+        val (_, els) = readScreen()
+        val img = shot()
+        val ui = els.joinToString("\n") { it.text.ifEmpty { it.desc } }.take(3000)
+        val parts = JSONArray().put(JSONObject().put("text", "User question: $q\nVisible text on screen:\n$ui"))
+        if (img != null) parts.put(imgPart(img))
+        val r = gem(parts, ASK_SYS, false, false, g)
+        if (alive(g)) reply(r.trim())
+    }
+
+    private fun answerQ(q: String, g: Int) {
+        val mem = facts().joinToString("; ")
+        val parts = JSONArray().put(JSONObject().put("text", "About the user: $mem\nQuestion: $q"))
+        val r = gem(parts, ASK_SYS, false, true, g)
+        if (alive(g)) reply(r.trim())
     }
 
     // ---------- AI agent (bigger tasks) ----------
@@ -728,39 +988,46 @@ Rules:
     private fun agent(goal: String, g: Int) {
         val hist = mutableListOf<String>()
         val apps = appList()
-        show("On it\u2026", 2000)
         for (step in 1..25) {
             if (!alive(g)) return
             val (pkg, els) = readScreen()
-            val a = think(goal, pkg, els, hist, apps, g)
+            val img = if (els.size < 6) shot() else null
+            val a = think(goal, pkg, els, hist, apps, g, img)
             if (!alive(g)) return
             val k = a.optString("action")
-            if (k == "done") { say(a.optString("message", "All done.")); return }
+            if (k == "done") { reply(a.optString("message", "All done.")); return }
             if (k == "ask_user") {
                 val r = ask(a.optString("message", "Could you tell me a bit more?"), g)
                 if (!alive(g)) return
-                if (r.isBlank()) { show("I didn't hear anything, so I'll stop here.", 4000); return }
+                if (r.isBlank()) { card("I didn't hear anything, so I'll stop here.", 4000); return }
                 hist.add("asked the user, who said: $r")
                 paint(2)
                 continue
             }
-            if (a.optBoolean("risky")) {
-                val r = ask(a.optString("message", "Should I go ahead?"), g)
+            val e = if (k == "tap") els.getOrNull(a.optInt("index", -1)) else null
+            val label = if (e == null) "" else e.text.ifEmpty { e.desc }
+            val forced = e != null && SENSITIVE.containsMatchIn(label.lowercase())
+            if (a.optBoolean("risky") || forced) {
+                val q = if (forced && !a.optBoolean("risky")) "Should I tap \"$label\"?"
+                else a.optString("message", "Should I go ahead?")
+                val r = ask(q, g)
                 if (!alive(g)) return
                 if (!Regex("\\b(yes|yeah|yep|sure|ok|okay|go ahead|do it|haan|ha)\\b")
                         .containsMatchIn(r.lowercase())) {
-                    show("Okay, I won't.", 3000)
+                    card("Okay, I won't.", 3000)
                     return
                 }
                 paint(2)
             }
-            hist.add(act(a, els))
+            val did = act(a, els)
+            log(did)
+            hist.add(did)
             if (hist.size >= 4 && hist.takeLast(4).distinct().size == 1) {
-                say("I'm a bit stuck. Could you take it from here?")
+                reply("I'm a bit stuck. Could you take it from here?")
                 return
             }
         }
-        show("That's taking longer than expected, so I'll stop here.", 4000)
+        card("That's taking longer than expected, so I'll stop here.", 4000)
     }
 
     private fun appList(): String {
@@ -810,45 +1077,58 @@ Rules:
             c.doOutput = true
             c.outputStream.use { it.write(b.toString().toByteArray()) }
             val code = c.responseCode
-            if (code in 200..299) return c.inputStream.bufferedReader().readText()
+            if (code in 200..299) {
+                val raw = c.inputStream.bufferedReader().readText()
+                val ps = JSONObject(raw).getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts")
+                val sb = StringBuilder()
+                for (i in 0 until ps.length()) sb.append(ps.getJSONObject(i).optString("text", ""))
+                return sb.toString()
+            }
             if (code == 400 && attempt == 0) continue
             throw Exception("Gemini error $code")
         }
         throw Exception("Gemini error 400")
     }
 
-    private fun think(goal: String, pkg: String, els: List<El>, hist: List<String>,
-                      apps: String, g: Int): JSONObject {
-        val key = getSharedPreferences("m", MODE_PRIVATE).getString("key", "") ?: ""
-        val ui = els.joinToString("\n") {
-            "${it.i}|${it.text}|${it.desc}|${it.id.take(24)}|${if (it.click) "c" else ""}${if (it.edit) "e" else ""}"
-        }
-        val prompt = "GOAL: $goal\nCURRENT APP: $pkg\nAPPS: $apps\nDONE SO FAR: ${hist.takeLast(8)}\nSCREEN:\n$ui"
+    private fun gem(parts: JSONArray, system: String, json: Boolean, search: Boolean, g: Int): String {
+        val key = getP().getString("key", "") ?: ""
+        val gc = JSONObject().put("temperature", 0.2)
+        if (json) gc.put("responseMimeType", "application/json")
         val body = JSONObject()
             .put("system_instruction", JSONObject().put("parts",
-                JSONArray().put(JSONObject().put("text", SYS))))
-            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts",
-                JSONArray().put(JSONObject().put("text", prompt)))))
-            .put("generationConfig", JSONObject()
-                .put("responseMimeType", "application/json").put("temperature", 0.2))
-        var txt: String? = null
+                JSONArray().put(JSONObject().put("text", system))))
+            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", parts)))
+            .put("generationConfig", gc)
+        if (search) body.put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
         var last: Exception? = null
-        loop@ for (m in MODELS) {
+        for (m in MODELS) {
             for (t in 1..2) {
                 try {
-                    txt = call(m, key, body)
-                    break@loop
+                    return call(m, key, body)
                 } catch (e: Exception) {
                     if (!alive(g)) throw e
                     last = e
                     val msg = e.message ?: ""
-                    if (msg.contains("503") || msg.contains("500")) Thread.sleep(500) else break
+                    if (msg.contains("503") || msg.contains("500")) Thread.sleep(400) else break
                 }
             }
         }
-        val raw = txt ?: throw (last ?: Exception("Gemini failed"))
-        val t = JSONObject(raw).getJSONArray("candidates").getJSONObject(0)
-            .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+        throw last ?: Exception("Gemini failed")
+    }
+
+    private fun think(goal: String, pkg: String, els: List<El>, hist: List<String>,
+                      apps: String, g: Int, img: String?): JSONObject {
+        val ui = els.joinToString("\n") {
+            "${it.i}|${it.text}|${it.desc}|${it.id.take(24)}|${if (it.click) "c" else ""}${if (it.edit) "e" else ""}"
+        }
+        val mem = facts().joinToString("; ")
+        val prompt = "GOAL: $goal\nMEMORY: $mem\nCURRENT APP: $pkg\nAPPS: $apps\nDONE SO FAR: ${hist.takeLast(8)}\nSCREEN:\n$ui"
+        val parts = JSONArray().put(JSONObject().put("text", prompt))
+        if (img != null) parts.put(imgPart(img))
+        var t = gem(parts, SYS, true, false, g).trim()
+        if (t.startsWith("```")) t = t.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+        if (t.startsWith("[")) return JSONArray(t).getJSONObject(0)
         return JSONObject(t)
     }
 
@@ -877,9 +1157,13 @@ Rules:
                 } else "tap failed: bad index"
             }
             "type" -> {
-                typeText(a.optString("text"))
-                settle(600)
-                "typed " + a.optString("text")
+                if (typeText(a.optString("text"))) {
+                    settle(600)
+                    "typed " + a.optString("text")
+                } else {
+                    card("Please type passwords yourself. I stay out of those.", 4000)
+                    "skipped a password field"
+                }
             }
             "key" -> {
                 when (a.optString("key")) {
@@ -959,12 +1243,14 @@ Rules:
         return null
     }
 
-    private fun typeText(t: String) {
-        val root = rootInActiveWindow ?: return
-        val n = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: firstEditable(root) ?: return
+    private fun typeText(t: String): Boolean {
+        val root = rootInActiveWindow ?: return true
+        val n = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: firstEditable(root) ?: return true
+        if (n.isPassword) return false
         val b = Bundle()
         b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, t)
         n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)
+        return true
     }
 
     private fun pressEnter() {
